@@ -14,9 +14,9 @@ Total Points: 1600
 | [Smart Bid](./SmartBid/README.md) | WEB3 | 400 | Easy |
 
 ## Quick Links
-- [My Portfolio](your-portfolio-link)
-- [GitHub](your-github)
-- [LinkedIn](your-linkedin)
+
+- [My GitHub](https://github.com/5up3rUs3r)
+- [CTF Writeups Repo](https://github.com/5up3rUs3r/CTF-Writeups)
 
 ## About
 These writeups document my solutions for the PerfectRoot CTF 2025. Each challenge taught me valuable lessons in penetration testing, web security, and blockchain exploitation.
